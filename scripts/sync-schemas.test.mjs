@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { planSync } from "./sync-schemas.mjs";
+import { parseBlocks } from "./yaml-blocks.mjs";
 
 const EXPORT = "specs/v1/export/components/schemas";
 const TP = "specs/v1/tradingpartnerconnector/components/schemas";
@@ -12,6 +13,7 @@ function plan({ synced, tree, editorial = {}, quarantined = {}, referenced = {},
 		ref: "test-ref",
 		has: (path) => Object.hasOwn(tree, path),
 		read: (path) => tree[path],
+		outline: (path) => parseBlocks(tree[path]),
 		isPublished: (domain) => !unpublished.includes(domain),
 	};
 	const map = { synced, referenced, editorial, quarantined };
@@ -86,27 +88,144 @@ test("fails when a mapped source is missing upstream", () => {
 	);
 });
 
-test("fails on an x-internal property in a file it would write", () => {
+test("strips x-internal properties, and does not pull in what only they reference", () => {
 	const result = plan({
 		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
 		tree: {
 			[`${EXPORT}/request.yml`]: "Request:\n  $ref: './base.yml#/ExportBase'\n",
-			[`${EXPORT}/base.yml`]: "ExportBase:\n  properties:\n    preview:\n      x-internal: true\n      type: string\n",
+			[`${EXPORT}/base.yml`]: [
+				"ExportBase:",
+				"  properties:",
+				"    name:",
+				"      type: string",
+				"    preview:",
+				"      x-internal: true",
+				"      $ref: '../../../agentgroup/components/schemas/group.yml#/Group'",
+				"",
+			].join("\n"),
+		},
+		unpublished: ["agentgroup"],
+	});
+	assert.deepEqual(result.errors, []);
+	assert.equal(result.files.get(`${SKILL}/schemas/base.yml`), "ExportBase:\n  properties:\n    name:\n      type: string\n");
+	assert.deepEqual(Object.keys(result.referenced), [`${SKILL}/schemas/base.yml`]);
+});
+
+test("drops an entry whose $ref points at a node upstream flags x-internal", () => {
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		tree: {
+			[`${EXPORT}/request.yml`]: [
+				"Request:",
+				"  properties:",
+				"    gate:",
+				"      $ref: './gate.yml#/Gate'",
+				"    name:",
+				"      type: string",
+				"",
+			].join("\n"),
+			[`${EXPORT}/gate.yml`]: "Gate:\n  x-internal: true\n  type: object\n",
 		},
 	});
-	assert.match(result.errors.join("\n"), /base\.yml .*has an x-internal property — quarantine it/);
-	assert.equal(result.files.has(`${SKILL}/schemas/base.yml`), false);
+	assert.deepEqual(result.errors, []);
+	assert.equal(result.files.get(`${SKILL}/schemas/request.yml`), "Request:\n  properties:\n    name:\n      type: string\n");
+	assert.deepEqual(result.referenced, {});
+});
+
+test("fails when x-internal survives stripping", () => {
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		tree: { [`${EXPORT}/request.yml`]: "Request:\n  properties:\n    preview: { type: string, x-internal: true }\n" },
+	});
+	assert.deepEqual(result.errors, [
+		`${SKILL}/schemas/request.yml: source ${EXPORT}/request.yml still contains x-internal after stripping`,
+	]);
+	assert.equal(result.files.has(`${SKILL}/schemas/request.yml`), false);
+});
+
+test("fails on any x-internal left in a written file, even a false flag", () => {
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		tree: { [`${EXPORT}/request.yml`]: "Request:\n  properties:\n    kept:\n      x-internal: false\n      type: string\n" },
+	});
+	assert.match(result.errors.join("\n"), /still contains x-internal after stripping/);
+});
+
+test("refuses to strip a flagged file with YAML the outline can't place", () => {
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		tree: {
+			[`${EXPORT}/request.yml`]: [
+				"Request:",
+				"  properties:",
+				"    ? complex",
+				"    : value",
+				"    gate:",
+				"      x-internal: true",
+				"",
+			].join("\n"),
+		},
+	});
+	assert.deepEqual(result.errors, [
+		`${SKILL}/schemas/request.yml: source ${EXPORT}/request.yml has x-internal and YAML the stripper can't outline (line 3)`,
+	]);
+});
+
+test("drops an entry whose $ref reaches a flagged node through an alias", () => {
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		tree: {
+			[`${EXPORT}/request.yml`]: [
+				"Request:",
+				"  properties:",
+				"    gate:",
+				"      $ref: '../../../common/schemas/alias.yml#/Alias'",
+				"    name:",
+				"      type: string",
+				"",
+			].join("\n"),
+			[`${COMMON}/alias.yml`]: "Alias:\n  $ref: '#/Gate'\nGate:\n  x-internal: true\n  type: object\n",
+		},
+	});
+	assert.deepEqual(result.errors, []);
+	assert.equal(result.files.get(`${SKILL}/schemas/request.yml`), "Request:\n  properties:\n    name:\n      type: string\n");
+	assert.deepEqual(result.referenced, {});
+});
+
+test("strips a quarantined file's upstream before following its refs", () => {
+	const local = "ExportBase:\n  type: object\n";
+	const result = plan({
+		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
+		quarantined: { [`${SKILL}/schemas/base.yml`]: { source: `${EXPORT}/base.yml`, reason: "spec bug" } },
+		localFiles: { [`${SKILL}/schemas/base.yml`]: local },
+		unpublished: ["agentgroup"],
+		tree: {
+			[`${EXPORT}/request.yml`]: "Request:\n  $ref: './base.yml#/ExportBase'\n",
+			[`${EXPORT}/base.yml`]: [
+				"ExportBase:",
+				"  type: object",
+				"  properties:",
+				"    group:",
+				"      x-internal: true",
+				"      $ref: '../../../agentgroup/components/schemas/group.yml#/Group'",
+				"",
+			].join("\n"),
+			"specs/v1/agentgroup/components/schemas/group.yml": "Group:\n  type: object\n",
+		},
+	});
+	assert.deepEqual(result.errors, []);
+	assert.deepEqual(result.referenced, {});
 });
 
 test("keeps a quarantined referenced file's local copy but still follows its upstream refs", () => {
 	const local = "ExportBase:\n  properties:\n    http:\n      $ref: './http.yml#/Http'\n";
 	const result = plan({
 		synced: { [`${SKILL}/schemas/request.yml`]: `${EXPORT}/request.yml` },
-		quarantined: { [`${SKILL}/schemas/base.yml`]: { source: `${EXPORT}/base.yml`, reason: "x-internal" } },
+		quarantined: { [`${SKILL}/schemas/base.yml`]: { source: `${EXPORT}/base.yml`, reason: "spec bug" } },
 		localFiles: { [`${SKILL}/schemas/base.yml`]: local },
 		tree: {
 			[`${EXPORT}/request.yml`]: "Request:\n  $ref: './base.yml#/ExportBase'\n",
-			[`${EXPORT}/base.yml`]: `${local}    preview:\n      x-internal: true\n`,
+			[`${EXPORT}/base.yml`]: `${local}    broken:\n      type: [string\n`,
 			[`${EXPORT}/http.yml`]: "Http:\n  type: object\n",
 		},
 	});
