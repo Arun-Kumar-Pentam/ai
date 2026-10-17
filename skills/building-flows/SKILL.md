@@ -50,13 +50,13 @@ Page generators feed records into `routers[]` instead of `pageProcessors[]`. Eac
 
 Two routing modes (shared with APIs and tools):
 - **Input filters** (`routeRecordsUsing: "input_filters"`) -- S-expression rules on each branch; last branch can omit filter as a catch-all
-- **Script-based** (`routeRecordsUsing: "script"`) -- a JavaScript function returns the branch name
+- **Script-based** (`routeRecordsUsing: "script"`) -- a JavaScript `branching` function returns, per record, an array of branch indices -- zero-based positions in `branches[]` (e.g. `[0]`)
 
 Flows support both `first_matching_branch` and `all_matching_branches` routing. APIs only support `first_matching_branch`. Tools support `first_matching_branch` only.
 
 A flow uses EITHER `pageProcessors` (linear) OR `routers` (branching) at the top level -- not both.
 
-When a branching flow needs linear steps before the branch point (e.g., a lookup enrichment or AI classification that all branches depend on), use a **pass-through router**: a single-branch router with `nextRouterId` pointing to the branching router. Omit `routeRecordsTo` and `routeRecordsUsing` on the pass-through router -- including them makes it appear as a filter-based branch in the UI. The API defaults are sufficient.
+When a branching flow needs linear steps before the branch point (e.g., a lookup enrichment or AI classification that all branches depend on), use a **pass-through router**: a single-branch router with `nextRouterId` pointing to the branching router. Omit `routeRecordsTo` and `routeRecordsUsing` on the pass-through router -- including them makes it appear as a filter-based branch in the UI. Leaving both unset is the pass-through shape; the server fills in no default.
 
 ### Abstract / Instance Flows
 
@@ -174,7 +174,7 @@ celigo templates marketplace
 celigo templates preview <id> --summary
 ```
 
-The account index auto-refreshes when stale (>4 hours). Force a fresh snapshot with `celigo account snapshot`.
+The account index auto-refreshes when stale (older than 15 minutes by default). Force a fresh snapshot with `celigo account snapshot`.
 
 ### 4. Build the connections, exports, and imports
 
@@ -200,13 +200,13 @@ See `configuring-exports` and `configuring-imports` for how to build each resour
 | Records should fan out to all matching paths | Branching with `all_matching_branches` |
 | Same structure across multiple tenants/regions | Abstract + instance flows |
 
-**Abstract/instance flows:** Abstract flows are reusable templates that cannot run directly. Instance flows inherit the abstract's structure and override specific fields (connections, filters, schedules). Use when the same integration pattern repeats across tenants or regions. Create with `isAbstract: true`. Top-level `pageProcessors` are automatically wrapped into a single-branch router. Instance flows reference the abstract via `_abstractFlowId` and specify overrides -- they do NOT use the normal scaffolding process. `_integrationId` is NOT inherited and must be set explicitly on the instance.
+**Abstract/instance flows:** Abstract flows are reusable templates that cannot run directly. Instance flows inherit the abstract's structure and override specific fields (connections, filters, schedules). Use when the same integration pattern repeats across tenants or regions. Create with `isAbstract: true`. An abstract flow can't use top-level `pageProcessors` -- the platform rejects them with 422 `abstract_flow_invalid_fields` -- so put even a linear chain in `routers[]`, as one [pass-through router](#branching-flows) (a single branch, neither `routeRecordsTo` nor `routeRecordsUsing` set). Instance flows reference the abstract via `_abstractFlowId` and specify overrides -- they do NOT use the normal scaffolding process. `_integrationId` is NOT inherited and must be set explicitly on the instance.
 
 ### 6. Design the step sequence
 
 For each step, decide:
 - **Type** -- `import` (write to destination) or `export` (lookup for enrichment)
-- **Response mapping** -- what data from this step's response do downstream steps need? **Only add response mapping when downstream steps need fields that aren't already in the record or when field names need to change.** If the lookup returns fields with the same names the downstream step expects, skip the response mapping -- it adds complexity without value.
+- **Response mapping** -- what does a downstream step need from this step's response? A response reaches the record only through the step's response mapping (or a `postResponseMap` hook); without one it's discarded after the call, even when its field names already match what the next step expects. Every lookup whose results are used downstream needs one; skip it only when nothing downstream reads this step's response (often a terminal import).
 - **proceedOnFailure** -- should the pipeline continue if this step fails?
 - **Hooks** -- does this step need a `postResponseMap` script?
 
@@ -229,7 +229,7 @@ Flow-level and per-step switches that change production behavior. APIs and tools
 | `proceedOnFailure` | per processor | `false` (a failed record stops there) | The step is non-critical and downstream steps still do meaningful work without it (a Slack notification late in the flow shouldn't block the sync). Keep `false` when downstream depends on this step's output |
 | `skipRetries` | flow, and per generator | `false` (failed jobs retry) | Work is time-sensitive (retrying a stale webhook is meaningless) or non-idempotent (retries risk duplicates). Per-generator override: set it only on the real-time generator |
 | `runPageGeneratorsInParallel` | flow | `false` (generators run sequentially) | Sources are independent and can take the load. Careful: parallel generators hitting the same API can blow rate limits that sequential runs respect |
-| `autoResolveMatchingTraceKeys` | flow | duplicate trace keys raise an error | The source genuinely emits duplicates in normal operation, or the flow is intentionally idempotent. Don't enable it to paper over upstream duplication |
+| `autoResolveMatchingTraceKeys` | flow | `true` on every new flow: a new error for a record auto-resolves that record's older open errors on the step, a later success resolves them all, and errors classified `intermittent` retry automatically (up to four attempts, the first about 30 minutes later) | Rarely. Off, every failure of a record stays open until someone resolves it, and intermittent errors get no automatic retry. Repeated trace keys are normal (delta re-emits, retries) and never raise an error -- a `duplicate` classification means the destination already holds the record, so turning this off doesn't fix it |
 
 ### 10. Configure chaining (if needed)
 
@@ -252,9 +252,9 @@ celigo flows set <id> key=value [key2=value2 ...]
 celigo flows delete <id>
 
 # Run
-celigo flows run <id> [--start-date <ISO8601>] [--end-date <ISO8601>] [--export-ids <ids>] -y
+celigo flows run <id> [--start-time <ISO8601>] [--end-time <ISO8601>] [--export-ids <ids>] -y
 
-# Test run (stage-by-stage)
+# Test run (stage-by-stage; the flow must be disabled -- 403 otherwise)
 celigo flows test-run <id> --export <exportId>
 celigo flows test-run-step-results <id> <runId> <exportOrImportId>
 
@@ -276,7 +276,7 @@ celigo flows retry-errors <id> <exportOrImportId> [retryDataKeys] [-y]
 celigo flows assign-errors <id> <exportOrImportId> <email> [errorIds] [-y]
 celigo flows delete-resolved-errors <id> <exportOrImportId> [errorIds] [-y]
 celigo flows error <id> <exportOrImportId> <errorId> [--retry-data] [--request-detail]
-celigo flows update-error-data <id> <exportOrImportId> <errorId>
+celigo flows update-error-data <id> <exportOrImportId> <errorId> < data.json
 celigo flows tag-errors <id> <exportOrImportId>
 celigo flows error-summary <id>
 celigo flows error-analysis <id> <exportOrImportId> [--limit <n>]
@@ -323,14 +323,15 @@ Before creating or updating a flow, verify:
 7. **Instance flows cannot define structure.** Do not set `pageGenerators`, `pageProcessors`, or `routers` on instance flows -- these are inherited from the abstract flow. All customizations go through `overrides`.
 8. **Instance flow `overrides` is full-replace on PUT.** Omitting an override entry removes it. Always GET, merge changes, then PUT.
 9. **Empty `pageProcessors: []` in a branch is the discard pattern.** Records matching that branch are dropped. A branch with no `inputFilter` serves as a catch-all.
-10. **`responseMapping` uses Transformation 1.0 syntax** (extract/generate pairs), not expression-based transforms. Lookup export responses use `data[0].fieldName`; import responses use `_json.fieldName`.
-11. **Don't add unnecessary transforms on lookups.** If the lookup returns fields with the same names the downstream import expects, skip the transform -- the data flows through as-is. Only add a transform when you need to rename fields, reshape nested structures, or drop fields. An identity transform (e.g., `errorId` -> `$.errorId`) adds complexity for no benefit.
+10. **`responseMapping` uses Transformation 1.0 syntax** (extract/generate pairs), not expression-based transforms. Lookup export responses use `data[0].fieldName`; import responses use `id` for the created record's ID and `_json.fieldName` for response-body fields.
+11. **Don't add identity transforms on lookups.** A lookup's `transform` only reshapes its results (the `data` array response mapping extracts from); it never puts them on the record -- the response mapping does. If the results already have the shape you need, skip the transform and extract directly (`data[0].<field>`). Only add a transform to rename fields, reshape nested structures, or drop fields; an identity transform (e.g., `errorId` -> `$.errorId`) adds complexity for no benefit.
 
 ## Common Errors
 
 | Error | Cause | Fix |
 |-------|-------|-----|
 | `"pageProcessors" is not allowed when "routers" is present` | Both `pageProcessors[]` and `routers[]` set on the same flow | Remove one -- use `pageProcessors` for linear, `routers` for branching |
+| `422 abstract_flow_invalid_fields` | Top-level `pageProcessors` on an abstract flow (`isAbstract: true`) | Move the chain into one pass-through router in `routers[]` |
 | `Invalid reference: _integrationId` | Integration ID does not exist or is misspelled | Verify with `celigo integrations get <id>` |
 | `Invalid reference: _exportId` / `_importId` | Export or import referenced in a page generator/processor does not exist | Create the export/import first, then reference it |
 | `Invalid reference: _connectionId` | Connection ID on an export or import does not exist | Verify with `celigo connections get <id>` |

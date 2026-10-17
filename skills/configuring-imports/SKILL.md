@@ -11,11 +11,11 @@ An import is the **data destination** in a Celigo integration. It takes records 
 
 Imports handle six concerns:
 
-- **Field mapping** -- transforming source fields into the destination system's expected format (including value resolution via static maps and lookup tables). Uses Mapper 2.0 (`mappings[]` array) by default; NetSuite and Salesforce imports only support Mapper 1.0 (`mapping.fields[]` / `mapping.lists[]`)
+- **Field mapping** -- transforming source fields into the destination system's expected format (including value resolution via static maps and lookup tables). Uses Mapper 2.0 (`mappings[]` array) by default, including `NetSuiteHTTPImport`. `SalesforceImport` supports only Mapper 1.0 (`mapping.fields[]` / `mapping.lists[]`), and `NetSuiteDistributedImport` uses its own Mapper 1.0 dialect at `netsuite_da.mapping`
 - **Operation logic** -- create, update, upsert, delete, attach/detach
 - **Hooks** -- JavaScript pre/post processing at various pipeline stages (preMap, postMap, postSubmit). File-based imports that generate files from records also support postAggregate
-- **One-to-many** -- fan out child records from a parent. Set `oneToMany: true` and `pathToMany` to the child array path (e.g., `"lineItems"`) when one source record should create multiple import operations
-- **Response mapping** -- extract fields from the import's API response back into the record for downstream steps. Configured on the flow's `pageProcessors[]` entry, but planned when building the import. The response is available via `_json` (the raw API response) and `errors`. Use `_json.fieldName` to extract from the response (e.g., `_json.id` for a created record's ID, `_json.output.1.content.0.text` for OpenAI responses). Response mapping uses Transformation 1.0 syntax (extract/generate pairs), not the newer expression-based transforms
+- **One-to-many** -- fan out child records from a parent. Set `oneToMany: true` and `pathToMany` to the child array path (e.g., `"lineItems"`) when one source record should create multiple import operations. Leave `pathToMany` blank when the arriving record is itself an array (grouped rows from a `groupByFields` export or a file group) -- each element then becomes the record. A path on an array record processes zero children and still reports success; a blank path on an object record fails with `oneToMany_error`
+- **Response mapping** -- extract fields from the import's API response back into the record for downstream steps. Configured on the flow's `pageProcessors[]` entry, but planned when building the import. Extracts read the response envelope: `id` (the destination-assigned record ID), `statusCode`, `ignored`, `errors`, and `_json` (the raw response body, whose top-level fields are also flattened onto the envelope). Use `id` for a created record's ID and `_json.fieldName` for other response fields (e.g., `_json.output.1.content.0.text` for OpenAI responses) -- `_json.id` works only when the body itself has a top-level `id`. Flow test runs never send imports, so `id` is empty there. Response mapping uses Transformation 1.0 syntax (extract/generate pairs), not the newer expression-based transforms
 - **postResponseMap hook** -- JavaScript processing after response mapping merges the response back into the record. Configured on the flow's `pageProcessors[]` entry, but planned when building the import. Use to transform or enrich the merged record before downstream steps
 
 Imports are used across flows, APIs, and tools.
@@ -24,7 +24,7 @@ Imports are used across flows, APIs, and tools.
 
 When records arrive at an import step, this pipeline executes in strict order:
 
-1. **Input filter** (optional) -- discards records before any processing (configured as an expression on the flow's `pageProcessors[]` entry)
+1. **Input filter** (optional) -- records that don't match skip this import (see [Gotchas](#gotchas)). Configured as `filter` on the import resource itself -- an `inputFilter` key on an import is silently discarded. See [configuring-filters](../configuring-filters/SKILL.md#import-filter-import-filter)
 2. **preMap hook** (optional) -- JavaScript processing before field mapping
 3. **Field mapping** -- Mapper 2.0 or 1.0 maps source fields to destination fields, including lookups and hardcoded values
 4. **postMap hook** (optional) -- JavaScript processing after field mapping, before submission
@@ -41,7 +41,8 @@ When records arrive at an import step, this pipeline executes in strict order:
 
 Submit structured records to APIs, databases, or ERPs. The vast majority of imports.
 
-- `NetSuiteDistributedImport` -- high-performance SuiteApp writes (add, update, addupdate, delete, attach, detach)
+- `NetSuiteDistributedImport` -- high-performance SuiteApp writes (add, update, addupdate, delete, attach, detach). The default for NetSuite when the Celigo SuiteApp or bundle is installed
+- `NetSuiteHTTPImport` -- NetSuite's REST APIs on a `netsuite` connection (`nsDomainType: "suitetalk"`: `POST /services/rest/record/v1/<type>` to insert, `PATCH .../<type>/{id}` to update; `"restlet"` for a custom RESTlet). Use it when neither the SuiteApp nor the bundle is installed, or the user asks for REST
 - `HTTPImport` -- REST/GraphQL APIs (POST, PUT, PATCH, DELETE). Supports connector-assisted (`formType: "assistant"`) and GraphQL (`graph_ql`) modes
 - `SalesforceImport` -- Salesforce CRUD via SOAP, REST, Bulk, or Composite Record API
 - `RDBMSImport` -- SQL databases (Snowflake, PostgreSQL, MySQL, SQL Server, Oracle). Uses `per_record`, `bulk_insert`, or `bulk_load` query types
@@ -66,7 +67,7 @@ Adaptor types:
 
 Invoke AI models for classification, extraction, or safety checks. No `_connectionId` required unless using BYOK.
 
-- `AiAgentImport` -- OpenAI or Gemini model invocations with structured output, tool use, and reasoning
+- `AiAgentImport` -- LLM invocations (any provider in the `aiAgent.provider` enum) with structured output, tool use, and reasoning
 - `GuardrailImport` -- PII detection, content moderation, or custom AI-based validation
 
 ### Stack and Tool Imports
@@ -101,7 +102,8 @@ When an HTTP destination has no native upsert but exposes separate create and up
 | Your data goes to... | Use adaptorType | Category | Read schema |
 |---|---|---|---|
 | REST or GraphQL API | `HTTPImport` | Record-based | [http.yml](references/schemas/http.yml) |
-| NetSuite (any method) | `NetSuiteDistributedImport` | Record-based | [netsuitedistributed.yml](references/schemas/netsuitedistributed.yml) |
+| NetSuite, Celigo SuiteApp or bundle installed | `NetSuiteDistributedImport` | Record-based | [netsuitedistributed.yml](references/schemas/netsuitedistributed.yml) |
+| NetSuite, neither installed (or REST requested) | `NetSuiteHTTPImport` + `nsDomainType` | Record-based | [http.yml](references/schemas/http.yml) |
 | Salesforce objects | `SalesforceImport` | Record-based | [salesforce.yml](references/schemas/salesforce.yml) |
 | SQL database (Snowflake, PostgreSQL, etc.) | `RDBMSImport` | Record-based | [rdbms.yml](references/schemas/rdbms.yml) |
 | MongoDB | `MongodbImport` | Record-based | [mongodb.yml](references/schemas/mongodb.yml) |
@@ -112,7 +114,7 @@ When an HTTP destination has no native upsert but exposes separate create and up
 | Files to S3 | `S3Import` | File-based | [s3.yml](references/schemas/s3.yml) |
 | AS2 EDI transmission | `AS2Import` | File-based | [as2.yml](references/schemas/as2.yml) |
 | Local filesystem | `FileSystemImport` | File-based | [filesystem.yml](references/schemas/filesystem.yml) |
-| OpenAI / Gemini | `AiAgentImport` | AI | [aiagent.yml](references/schemas/aiagent.yml) |
+| An LLM (any provider in the `aiAgent.provider` enum) | `AiAgentImport` | AI | [aiagent.yml](references/schemas/aiagent.yml) |
 | PII detection / content moderation | `GuardrailImport` | AI | [guardrail.yml](references/schemas/guardrail.yml) |
 | Celigo Tool | `ToolImport` | Tool | [wrapper.yml](references/schemas/wrapper.yml) |
 | Pre-built stack connector | `WrapperImport` | Stack | [wrapper.yml](references/schemas/wrapper.yml) |
@@ -122,6 +124,8 @@ When an HTTP destination has no native upsert but exposes separate create and up
 1. **Native adaptor** -- if the application has its own row (NetSuite, Salesforce, databases, FTP/S3), use it. Do not build an `HTTPImport` against that app's REST API.
 2. **Pre-built HTTP connector** -- for any other REST/GraphQL app, check the 550+ connector catalog before writing HTTP config (see [Check for a pre-built connector](#3-check-for-a-pre-built-connector)). The step is still an `HTTPImport`, but it runs on a connector-backed connection and takes its endpoint config from the connector.
 3. **Manual HTTP** -- hand-write the config from public API docs only when no connector exists or it doesn't cover the operation you need.
+
+For NetSuite, run `celigo connections suiteapp-status <connectionId>`: `suiteapp.success` or `bundle.success` true means `NetSuiteDistributedImport`; both false means `NetSuiteHTTPImport`. `NetSuiteImport` is legacy -- don't use it unless asked.
 
 `adaptorType` is **case-sensitive**: `NetSuiteDistributedImport`, not `netsuitedistributedimport`.
 
@@ -201,7 +205,7 @@ celigo templates preview <id> --model Import
 celigo templates preview <id> --summary
 ```
 
-The account index auto-refreshes when stale (>4 hours). Force a fresh snapshot with `celigo account snapshot`.
+The account index auto-refreshes when stale (older than 15 minutes by default). Force a fresh snapshot with `celigo account snapshot`.
 
 ### 3. Check for a pre-built connector
 
@@ -249,12 +253,12 @@ Reference the [Schema Index](#schema-index) for the exact fields needed. Use the
 
 ## File Uploads over HTTP (multipart/form-data)
 
-Some destination APIs accept files only as `multipart/form-data` POSTs (Jira attachments, QuickBooks attachables, OpenAI file uploads). This is an `HTTPImport` in file-transfer mode (`http.type: "file"`) and works nothing like a JSON record write. Four pieces have to line up:
+Some destination APIs accept files only as `multipart/form-data` POSTs (Jira attachments, QuickBooks attachables, OpenAI file uploads). This is an `HTTPImport` with `blob: true` and `blobKeyPath`, posting to the API's upload endpoint, and it works nothing like a JSON record write. Do **not** set `http.type: "file"`: that is the folder mode of file-storage connectors (Google Drive, Box, Dropbox, Azure Blob), which treats `relativeURI` as a folder path -- combined with an API endpoint URL it saves cleanly and fails every record with "Directory is not found." Four pieces have to line up:
 
 1. **Where the bytes come from.** The import never carries the file itself. A preceding blob export or blob lookup pulls the file into blob storage, and that step's response mapping puts the reference onto the record -- the idiom is `{"extract": "data.0.blobKey", "generate": "blobKey"}`. The record then carries a `blobKey` (a storage pointer, not content).
 2. **The media type.** The connection's media type (or the import's request media type override) is `multipart/form-data`; success/error response media types usually override to JSON so replies parse normally.
 3. **The request body.** Not raw MIME and not a normal handlebars payload -- a JSON array of parts, each `{name, value, type}` plus optional `filename` (include the extension) and `mime-headers`. The file part is `"type": "attachment"` with `"value": "{{blob}}"` -- `{{blob}}` is the only accepted value for an attachment (anything else 422s). Fields the API wants alongside the file ride as `"type": "inline"` parts; an inline part whose value is a JSON object must be serialized. One file reference per import.
-4. **`blobKeyPath`** (Advanced settings) -- the JSON path in the record where the blobKey lives (`blobKey`, or `file.blobKey` if nested). At send time the platform follows it into blob storage and streams the real bytes into the attachment part.
+4. **`blob: true` + `blobKeyPath`** (Advanced settings) -- `blobKeyPath` is the JSON path in the record where the blobKey lives (`blobKey`, or `file.blobKey` if nested). At send time the platform follows it into blob storage and streams the real bytes into the attachment part.
 
 The platform assembles the final MIME body itself -- it generates the `boundary` (never hardcode one), writes each part's `Content-Disposition`, and substitutes the attachment part with the raw file bytes. The parts array is a build recipe, not the payload.
 
@@ -275,7 +279,8 @@ celigo imports update <id> < import.json
 celigo imports set <id> key=value [key2=value2 ...]
 celigo imports delete <id> [-y]
 
-# Invoke (test submission without creating a job)
+# Invoke -- a real write: each record is sent to the destination (no job is created).
+# HTTP 200 even when records fail; check each result's statusCode and errors
 echo '[{"name":"test"}]' | celigo imports invoke <id>
 
 # Clone and connection management
@@ -316,8 +321,8 @@ celigo imports disable-debug <id>
 ### Cross-resource consistency
 - [ ] Connection `type` matches the import's `adaptorType`
 - [ ] If response mapping needed: configured on the flow's `pageProcessors[]` entry, not on the import itself
-- [ ] If one-to-many: `oneToMany: true` and `pathToMany` is set to the child array path
-- [ ] If using Mapper 1.0 (NetSuite/Salesforce): `mapping.fields[]` / `mapping.lists[]`, not `mappings[]`
+- [ ] If one-to-many: `oneToMany: true`, with `pathToMany` set to the child array path for an object record and left blank for an array (grouped) record
+- [ ] Mapper 1.0 only where required: `mapping.fields[]` / `mapping.lists[]` on Salesforce, `netsuite_da.mapping` on NetSuite DA -- never `mappings[]` there. `NetSuiteHTTPImport` uses `mappings[]`
 
 ## Gotchas
 
@@ -334,6 +339,7 @@ celigo imports disable-debug <id>
 | 422 `adaptorType invalid` | Wrong case | Use exact case from decision matrix: `HTTPImport`, `NetSuiteDistributedImport`, etc. |
 | 422 `_connectionId required` | Missing connection | Set `_connectionId` to a valid connection ID |
 | 422 `queryType invalid` | Legacy Snowflake value | Use `per_record` or `bulk_insert`, not `insert`/`update` |
-| 422 `distributed required` | Missing NetSuite flag | Use `NetSuiteDistributedImport` with `distributed: true` on connection |
-| 422 `mapping invalid` | Wrong mapper version | NetSuite/Salesforce use Mapper 1.0 (`mapping.fields[]`), not Mapper 2.0 (`mappings[]`) |
+| 422 `distributed required` | Missing NetSuite flag | Use `NetSuiteDistributedImport` with `distributed: true` on the import (there's no such connection flag); check the SuiteApp with `celigo connections suiteapp-status <connectionId>` |
+| 422 `mapping invalid` | Wrong mapper version | Salesforce uses Mapper 1.0 (`mapping.fields[]`) and NetSuite DA uses `netsuite_da.mapping`, not Mapper 2.0 (`mappings[]`); `NetSuiteHTTPImport` uses `mappings[]` |
 | 422 attachment `value` invalid | Multipart file part is not `{{blob}}` | Set the file part to `"type": "attachment"`, `"value": "{{blob}}"`; let the platform generate the `boundary` |
+| Every record fails with "Directory is not found" | `http.type: "file"` (file-storage folder mode) combined with an API upload endpoint | Remove `http.type: "file"`; keep `blob: true` + `blobKeyPath` and post to the endpoint |
